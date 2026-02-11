@@ -12,9 +12,6 @@ class Paths(BaseModel):
     default_chunks: Path = processed_dir / "cap615.jsonl"
     default_index: Path = processed_dir / "embeddings.npy"
     bm25_store: Path = processed_dir / "bm25.pkl"
-    erc_raw: Path = raw_dir / "erc-3643.txt"
-    erc_chunks: Path = processed_dir / "erc3643.jsonl"
-    erc_whitelist: Path = processed_dir / "erc3643_whitelist.json"
 
 
 class Settings(BaseModel):

@@ -1,15 +1,17 @@
 import json
 import os
 import pickle
-import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple
 
 import argparse
 import numpy as np
 from dotenv import load_dotenv
 from rich.console import Console
+
+# Silence HF tokenizer fork warning in CLI/batch runs.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 from sentence_transformers import SentenceTransformer
 
 from .config import paths, settings
@@ -40,65 +42,6 @@ def load_bm25(bm25_path: Path):
     with bm25_path.open("rb") as f:
         payload = pickle.load(f)
     return payload["bm25"], payload["corpus"], payload["chunks"]
-
-
-def load_erc_whitelist(path: Path) -> Set[str]:
-    fallback = {
-        "IdentityRegistry",
-        "Compliance",
-        "ComplianceModule",
-        "TrustedIssuersRegistry",
-        "ClaimTopicsRegistry",
-        "Token",
-        "ModularCompliance",
-        "IdentityRegistryStorage",
-        "Recovery",
-        "canTransfer",
-        "isVerified",
-        "forceTransfer",
-        "freeze",
-        "unfreeze",
-        "pause",
-        "unpause",
-        "recoverAddress",
-        "registerIdentity",
-        "updateIdentity",
-        "deleteIdentity",
-        "batchTransfer",
-    }
-    if not path.exists():
-        return fallback
-    try:
-        data = json.loads(path.read_text())
-        items = set(data.get("modules_functions", []))
-        return items or fallback
-    except Exception:
-        return fallback
-
-
-def enforce_erc_whitelist(rule: Dict, allowed: Set[str]) -> Dict:
-    val = rule.get("erc_3643")
-    if not val:
-        rule["erc_3643"] = "N/A (off-chain)"
-        return rule
-    # split on common separators
-    parts = []
-    for chunk in re.split(r"[,&/]|and", str(val)):
-        name = chunk.strip()
-        if not name:
-            continue
-        parts.append(name)
-    normalized = []
-    for p in parts:
-        for allowed_item in allowed:
-            if p.lower() == allowed_item.lower():
-                normalized.append(allowed_item)
-                break
-    if normalized:
-        rule["erc_3643"] = ", ".join(sorted(set(normalized)))
-    else:
-        rule["erc_3643"] = "N/A (off-chain)"
-    return rule
 
 
 def normalize(scores: List[float]) -> List[float]:
@@ -190,29 +133,59 @@ def call_llm(prompt: str) -> Optional[str]:
     return resp.choices[0].message.content
 
 
+def parse_extraction_response(raw: Optional[str]) -> Dict[str, List[Dict]]:
+    """
+    Normalize the LLM response into a dict with "rules" and "contexts" lists.
+    Accepts either:
+      - the new object shape {"rules": [...], "contexts": [...]}, or
+      - a legacy top-level list of rules (treated as {"rules": list, "contexts": []}).
+    """
+    empty = {"rules": [], "contexts": []}
+    if not raw:
+        return empty
+    cleaned = raw.strip()
+    if not cleaned:
+        return empty
+    # Strip simple fences if present.
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        cleaned = cleaned.replace("json", "", 1).strip()
+    try:
+        data = json.loads(cleaned)
+    except Exception:
+        return empty
+
+    if isinstance(data, dict):
+        rules = data.get("rules") or []
+        contexts = data.get("contexts") or []
+        if not isinstance(rules, list):
+            rules = []
+        if not isinstance(contexts, list):
+            contexts = []
+        return {"rules": [r for r in rules if isinstance(r, dict)], "contexts": [c for c in contexts if isinstance(c, dict)]}
+    if isinstance(data, list):
+        # Legacy: treat as rules-only list.
+        return {"rules": [r for r in data if isinstance(r, dict)], "contexts": []}
+    return empty
+
+
 def run_extraction(query: str, top_k: int, dry_run: bool = False) -> Dict:
     retriever = Retriever()
     results = retriever.search(query, k=top_k)
     context = render_context(results)
-    allowed = load_erc_whitelist(paths.erc_whitelist)
-    whitelist_text = "\n".join(sorted(allowed))
-    prompt = build_prompt(context=context, query=query, erc_whitelist=whitelist_text)
+    prompt = build_prompt(context=context, query=query)
     response = None if dry_run else call_llm(prompt)
-    if response:
-        try:
-            parsed = json.loads(response)
-            # normalize into list
-            if isinstance(parsed, dict):
-                parsed = [parsed]
-            cleaned = [enforce_erc_whitelist(r, allowed) for r in parsed if isinstance(r, dict)]
-            response = json.dumps(cleaned, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+    parsed = parse_extraction_response(response) if response else {"rules": [], "contexts": []}
+    if parsed:
+        # Normalize response to the canonical object shape.
+        response = json.dumps(parsed, ensure_ascii=False, indent=2)
     return {
         "query": query,
         "top_k": top_k,
         "prompt": prompt,
         "response": response,
+        "rules": parsed.get("rules", []),
+        "contexts": parsed.get("contexts", []),
         "retrieved": [r.chunk for r in results],
     }
 

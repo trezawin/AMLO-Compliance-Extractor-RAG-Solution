@@ -1,17 +1,15 @@
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import json
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from .pipeline import Retriever, call_llm, render_context, load_erc_whitelist, enforce_erc_whitelist
-from .config import settings, paths
+from .pipeline import Retriever, call_llm, render_context, parse_extraction_response
+from .config import settings
 from .prompts import build_prompt, ROLE_PROMPT, TASK_INSTRUCTION
 
 app = FastAPI(title="AMLO RAG Extractor")
 retriever = Retriever()
-erc_allowed = load_erc_whitelist(paths.erc_whitelist)
-erc_whitelist_text = "\n".join(sorted(erc_allowed))
 
 
 class ExtractRequest(BaseModel):
@@ -34,21 +32,21 @@ class ExtractResponse(BaseModel):
     prompt: str
     response: Optional[str]
     retrieved: List[RetrievedChunk]
+    rules: Optional[List[Dict[str, Any]]] = None
+    contexts: Optional[List[Dict[str, Any]]] = None
 
 
 @app.post("/extract", response_model=ExtractResponse)
 def extract(body: ExtractRequest) -> ExtractResponse:
     results = retriever.search(body.query, k=body.top_k)
     context = render_context(results)
-    prompt = build_prompt(context=context, query=body.query, erc_whitelist=erc_whitelist_text)
+    prompt = build_prompt(context=context, query=body.query)
     response = None if body.dry_run else call_llm(prompt)
+    parsed = {"rules": [], "contexts": []}
     if response:
         try:
-            parsed = json.loads(response)
-            if isinstance(parsed, dict):
-                parsed = [parsed]
-            cleaned = [enforce_erc_whitelist(r, erc_allowed) for r in parsed if isinstance(r, dict)]
-            response = json.dumps(cleaned, ensure_ascii=False, indent=2)
+            parsed = parse_extraction_response(response)
+            response = json.dumps(parsed, ensure_ascii=False, indent=2)
         except Exception:
             pass
     return ExtractResponse(
@@ -56,6 +54,8 @@ def extract(body: ExtractRequest) -> ExtractResponse:
         prompt=prompt,
         response=response,
         retrieved=[RetrievedChunk(**r.chunk) for r in results],
+        rules=parsed.get("rules", []),
+        contexts=parsed.get("contexts", []),
     )
 
 

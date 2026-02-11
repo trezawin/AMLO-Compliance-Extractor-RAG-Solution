@@ -1,15 +1,32 @@
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from rich.console import Console
 
 from .config import paths
-from .pipeline import call_llm, load_erc_whitelist, enforce_erc_whitelist
+from .pipeline import call_llm, parse_extraction_response
 from .prompts import build_prompt
 
 console = Console()
+VALID_CONTEXT_TYPES = {
+    "DEFINITION",
+    "OBLIGATION_TEXT",
+    "GUIDANCE",
+    "CONSEQUENCE",
+    "SCOPE_NOTE",
+    "MAPPING_NOTE",
+}
+VALID_COMPLIANCE_CATEGORIES = {
+    "IDENTITY_ELIGIBILITY",
+    "TRUST_ANCHOR",
+    "TRANSFER_COMPLIANCE",
+    "JURISDICTION_RESTRICTION",
+    "TRANSACTION_LIMITS",
+    "ADMIN_ENFORCEMENT",
+}
 
 
 def load_chunks(path: Path) -> List[Dict]:
@@ -29,9 +46,19 @@ def group_by_section(chunks: List[Dict], max_tokens: int) -> List[Dict]:
             return
         section = buffer[0].get("section")
         heading = buffer[0].get("heading")
+        top_level_block = buffer[0].get("top_level_block")
+        top_level_kind = buffer[0].get("top_level_kind")
         texts = [c["text"] for c in buffer]
         context = "\n\n---\n\n".join(texts)
-        grouped.append({"section": section, "heading": heading, "context": context})
+        grouped.append(
+            {
+                "section": section,
+                "heading": heading,
+                "top_level_block": top_level_block,
+                "top_level_kind": top_level_kind,
+                "context": context,
+            }
+        )
         buffer = []
         buffer_tokens = 0
 
@@ -53,21 +80,94 @@ def group_by_section(chunks: List[Dict], max_tokens: int) -> List[Dict]:
     return grouped
 
 
-def parse_json_response(raw: Optional[str]) -> List[Dict]:
-    if not raw:
-        return []
-    # Strip simple fences if present.
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        cleaned = cleaned.replace("json", "", 1).strip()
-    try:
-        data = json.loads(cleaned)
-        if isinstance(data, list):
-            return data
-        return [data]
-    except Exception:
-        return []
+def build_human_ref(
+    section: Optional[str],
+    heading: Optional[str],
+    top_level_block: Optional[str],
+    top_level_kind: Optional[str],
+) -> str:
+    section_text = f"Section {section}" if section else "Section UNSPECIFIED"
+    if top_level_kind in {"Part", "Schedule"} and top_level_block:
+        base = f"{top_level_block}, {section_text}"
+    else:
+        base = section_text
+    if heading:
+        return f"{base} - {heading}"
+    return base
+
+
+def normalize_rule_ref(candidate: Optional[str], fallback_ref: str) -> str:
+    if not candidate:
+        return fallback_ref
+    text = str(candidate).strip()
+    if not text:
+        return fallback_ref
+    # Reject ambiguous refs like "12(2)(a)" without Part/Schedule/Section context.
+    has_context = bool(re.search(r"\b(Part|Schedule|Section)\b", text, flags=re.IGNORECASE))
+    bare_subref = bool(re.fullmatch(r"\d+[A-Za-z]?(?:\([^)]+\))*", text))
+    if bare_subref and not has_context:
+        return f"{fallback_ref}, subsection {text}"
+    if not has_context:
+        return f"{fallback_ref} - {text}"
+    return text
+
+
+def normalize_context_type(candidate: Optional[str]) -> Optional[str]:
+    if not candidate:
+        return None
+    value = str(candidate).strip().upper()
+    return value if value in VALID_CONTEXT_TYPES else None
+
+
+def normalize_compliance_category(candidate: Optional[str]) -> str:
+    if not candidate:
+        return "ADMIN_ENFORCEMENT"
+    value = str(candidate).strip().upper()
+    return value if value in VALID_COMPLIANCE_CATEGORIES else "ADMIN_ENFORCEMENT"
+
+
+def normalize_check_method(candidate: Optional[str]) -> Optional[str]:
+    if not candidate:
+        return None
+    value = str(candidate).strip().lower()
+    alias = {
+        "deterministic": "deterministic",
+        "binary-check": "deterministic",
+        "observational": "observational",
+        "observation": "observational",
+        "evidence": "observational",
+        "evidence-based": "observational",
+    }
+    return alias.get(value, value if value in {"deterministic", "observational"} else None)
+
+
+def normalize_pass_criteria(candidate: Optional[str]) -> Optional[str]:
+    if not candidate:
+        return None
+    value = str(candidate).strip().lower()
+    alias = {
+        "binary": "binary",
+        "pass/fail": "binary",
+        "pass-fail": "binary",
+        "evidence-based": "evidence-based",
+        "evidence based": "evidence-based",
+        "evidence": "evidence-based",
+    }
+    return alias.get(value, value if value in {"binary", "evidence-based"} else None)
+
+
+def normalize_obligation_nature(candidate: Optional[str]) -> Optional[str]:
+    if not candidate:
+        return None
+    value = str(candidate).strip().lower()
+    alias = {
+        "prohibition": "prohibition",
+        "must-not-have": "prohibition",
+        "requirement": "requirement",
+        "must-have": "requirement",
+        "capability": "capability",
+    }
+    return alias.get(value, value if value in {"prohibition", "requirement", "capability"} else None)
 
 
 def main():
@@ -79,12 +179,6 @@ def main():
     parser.add_argument("--offset", type=int, default=0, help="Skip this many grouped contexts before processing")
     parser.add_argument("--count", type=int, default=None, help="Process only this many grouped contexts after offset")
     parser.add_argument("--dry_run", action="store_true", help="Skip LLM calls; emit prompts only")
-    parser.add_argument(
-        "--erc_keywords",
-        type=str,
-        default="virtual asset,va service,token,transfer,identity,register,licence,license",
-        help="Comma-separated keywords; if none are found in a section context, skip calling the LLM.",
-    )
     args = parser.parse_args()
 
     chunks = load_chunks(args.chunks)
@@ -97,42 +191,84 @@ def main():
         grouped = grouped[: args.count]
     console.print(f"[cyan]Processing {len(grouped)} grouped contexts...")
 
-    allowed = load_erc_whitelist(paths.erc_whitelist)
-    whitelist_text = "\n".join(sorted(allowed))
-    kw_list = [k.strip().lower() for k in args.erc_keywords.split(",") if k.strip()]
+    rules_out: List[Dict] = []
+    contexts_out: List[Dict] = []
+    rule_counter = 0
+    context_counter = 0
 
-    all_rules: List[Dict] = []
     for idx, item in enumerate(grouped, 1):
         context = item["context"]
         section_label = item.get("section") or f"group-{idx}"
         query = "Extract enforceable obligations in this section."
-        prompt = build_prompt(context=context, query=query, erc_whitelist=whitelist_text)
+        prompt = build_prompt(context=context, query=query)
         if args.dry_run:
             console.print(f"[yellow]Dry run for section {section_label}; prompt length={len(prompt)}")
             continue
-        ctx_lower = context.lower()
-        if kw_list and not any(kw in ctx_lower for kw in kw_list):
-            console.print(f"[cyan]Skipping section {section_label}: no ERC keywords matched.")
-            continue
         resp = call_llm(prompt)
-        rules = parse_json_response(resp)
-        for rule in rules:
-            rule["section"] = item.get("section")
-            rule["heading"] = item.get("heading")
-            enforce_erc_whitelist(rule, allowed)
-        # Keep only rules with actionable ERC-3643 mapping
-        filtered = [r for r in rules if r.get("erc_3643") and r["erc_3643"] != "N/A (off-chain)"]
-        all_rules.extend(filtered)
+        parsed = parse_extraction_response(resp)
+        section = item.get("section")
+        heading = item.get("heading")
+        top_level_block = item.get("top_level_block")
+        top_level_kind = item.get("top_level_kind")
+        ref = build_human_ref(section, heading, top_level_block, top_level_kind)
+
+        # Normalize and enrich rules.
+        for rule in parsed.get("rules", []):
+            check_method = normalize_check_method(rule.get("check_method"))
+            pass_criteria = normalize_pass_criteria(rule.get("pass_criteria"))
+            obligation_nature = normalize_obligation_nature(rule.get("obligation_nature"))
+            # Enforce the minimal gating contract: keep only rules that
+            # have a claim + check_method + pass_criteria.
+            if not rule.get("rule_objective"):
+                continue
+            if check_method not in {"deterministic", "observational"}:
+                continue
+            if pass_criteria not in {"binary", "evidence-based"}:
+                continue
+            rule_counter += 1
+            normalized = {
+                "rule_id": f"R-{rule_counter}",
+                "rule_ref": normalize_rule_ref(rule.get("rule_ref"), ref),
+                "compliance_category": normalize_compliance_category(rule.get("compliance_category")),
+                "rule_objective": rule.get("rule_objective"),
+                "original_text": rule.get("original_text"),
+                "obligation_nature": obligation_nature,
+                "check_method": check_method,
+                "pass_criteria": pass_criteria,
+                # enforcement_interface intentionally omitted for now.
+            }
+            rules_out.append(normalized)
+
+        # Normalize and enrich contexts.
+        for ctx in parsed.get("contexts", []):
+            context_type = normalize_context_type(ctx.get("context_type"))
+            text = (ctx.get("text") or "").strip()
+            if not context_type or not text:
+                continue
+            context_counter += 1
+            normalized_ctx = {
+                "context_id": f"C-{context_counter}",
+                "source_ref": normalize_rule_ref(ctx.get("source_ref"), ref),
+                "context_type": context_type,
+                "text": text,
+                "notes": (ctx.get("notes") or "").strip() or None,
+            }
+            contexts_out.append(normalized_ctx)
+
         if idx % 10 == 0:
-            console.print(f"[green]Processed {idx}/{len(grouped)} contexts; total rules: {len(all_rules)}")
+            console.print(
+                f"[green]Processed {idx}/{len(grouped)} contexts; "
+                f"total rules: {len(rules_out)}, contexts: {len(contexts_out)}"
+            )
 
     if args.dry_run:
         console.print("[yellow]Dry run complete; no output file written.")
         return
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(all_rules, indent=2, ensure_ascii=False))
-    console.print(f"[bold green]Wrote {len(all_rules)} rules to {args.out}")
+    payload = {"rules": rules_out, "contexts": contexts_out}
+    args.out.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    console.print(f"[bold green]Wrote {len(rules_out)} rules and {len(contexts_out)} contexts to {args.out}")
 
 
 if __name__ == "__main__":
