@@ -13,7 +13,7 @@ Return a single JSON object with this shape:
   "rules": [
     {
       "rule_ref": "<human-readable legal citation with full hierarchy>",
-      "compliance_category": "DUE_DILIGENCE|ELIGIBILITY|CONTROL|TRANSFER_COMPLIANCE|TRANSACTION_LIMIT",
+      "compliance_category": "PREVENTIVE|MONITORING_ENFORCEMENT",
       "rule_objective": "<compliance intent; what must be achieved>",
       "original_text": "<EXACT ORIGINAL clause text from context; verbatim, no paraphrase>",
       "obligation_nature": "prohibition|requirement|capability",
@@ -57,19 +57,13 @@ Classification rules:
 - pass_criteria:
   - binary = direct pass/fail check.
   - evidence-based = presence/quality of evidence indicates satisfaction (default for capability obligations).
-  - If a Rule requires multiple steps and the justification relies on additional explanations or evidence, prefer:
-    - check_method = observational
-    - pass_criteria = evidence-based
-- compliance_category (choose exactly one; governance dimension of the obligation):
-  - DUE_DILIGENCE: Rules requiring verification of identity, residency, or risk-related attributes before a participant is allowed to interact with the token system.
-  - ELIGIBILITY: Rules defining which authorised entities or trust anchors are permitted to certify or attest compliance-relevant identity information.
-  - CONTROL: Rules requiring the system to maintain administrative or supervisory mechanisms that enable governance intervention or enforcement actions.
-  - TRANSFER_COMPLIANCE: Rules ensuring that each token transfer is validated against compliance conditions before execution.
-  - TRANSACTION_LIMIT: Rules imposing quantitative or frequency-based constraints on token holdings or transaction activities.
+- compliance_category (choose exactly one):
+  - PREVENTIVE: Controls that prevent non-compliant actions before they occur.
+  - MONITORING_ENFORCEMENT: Controls that detect, monitor, and enforce compliance after or during activity.
 - Category selection constraints:
-  - Pick the single best category based on the governance role of the obligation (what dimension of the system's compliance governance it is constraining).
+  - Pick the single best category based on the timing/intent of the control (before vs. during/after).
   - Do not output multiple categories, free-text labels, or synonyms.
-  - If a provision cannot be clearly placed in one of these categories, treat it as Context (not a Rule).
+  - If a provision cannot be clearly placed in one of these two categories, treat it as Context (not a Rule).
 
 General rules:
 - Answer only from the provided context; do not invent, compress, or rewrite text outside it.

@@ -298,21 +298,46 @@ def ingest(source: Path, out_path: Path) -> None:
     working_text = trim_front_matter(cleaned)
     sections = split_sections_with_positions(working_text)
 
-    # Build explicit spans for Schedule 2 and 3B using all schedule headings
-    # as boundaries, so we do not accidentally classify later schedules.
+    # Build explicit spans for Schedule 2 and 3B using robust schedule-heading
+    # clustering, so references like "5A. Schedule 2 has effect ..." are not
+    # treated as the schedule body.
     all_schedule_headers: List[Tuple[int, str]] = []
     for m in SCHEDULE_PATTERN.finditer(working_text):
         sched_num = (m.groupdict().get("num") or "").strip().upper()
         if not sched_num:
             continue
+        title = (m.groupdict().get("title") or "").strip().lower()
+        # Exclude Part 2 gateway clauses (e.g. "Schedule 2 has effect ...")
+        # and similar references that are not actual schedule headers.
+        if title.startswith("has effect"):
+            continue
         all_schedule_headers.append((m.start(), sched_num))
     all_schedule_headers.sort(key=lambda x: x[0])
 
+    # Group repeated "Schedule N" headings into clusters. Real schedule bodies
+    # produce dense clusters due to running headers; sparse one-offs are often noise.
+    cluster_gap = 20000
     target_schedule_spans: List[Tuple[int, int, str]] = []
-    for idx, (start, sched_num) in enumerate(all_schedule_headers):
-        end = all_schedule_headers[idx + 1][0] if idx + 1 < len(all_schedule_headers) else len(working_text)
-        if sched_num in {"2", "3B"}:
-            target_schedule_spans.append((start, end, f"Schedule {sched_num}"))
+    for target in ("2", "3B"):
+        target_positions = [pos for pos, num in all_schedule_headers if num == target]
+        if not target_positions:
+            continue
+        clusters: List[List[int]] = [[target_positions[0]]]
+        for pos in target_positions[1:]:
+            if pos - clusters[-1][-1] <= cluster_gap:
+                clusters[-1].append(pos)
+            else:
+                clusters.append([pos])
+        best_cluster = max(clusters, key=len)
+        span_start = best_cluster[0]
+        span_end = len(working_text)
+        for pos, num in all_schedule_headers:
+            if pos <= best_cluster[-1]:
+                continue
+            if num != target:
+                span_end = pos
+                break
+        target_schedule_spans.append((span_start, span_end, f"Schedule {target}"))
 
     def schedule_for(pos: int) -> Optional[str]:
         for start, end, label in target_schedule_spans:

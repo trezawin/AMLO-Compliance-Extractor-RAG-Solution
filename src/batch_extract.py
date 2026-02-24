@@ -20,12 +20,11 @@ VALID_CONTEXT_TYPES = {
     "MAPPING_NOTE",
 }
 VALID_COMPLIANCE_CATEGORIES = {
-    "IDENTITY_ELIGIBILITY",
-    "TRUST_ANCHOR",
+    "DUE_DILIGENCE",
+    "ELIGIBILITY",
+    "CONTROL",
     "TRANSFER_COMPLIANCE",
-    "JURISDICTION_RESTRICTION",
-    "TRANSACTION_LIMITS",
-    "ADMIN_ENFORCEMENT",
+    "TRANSACTION_LIMIT",
 }
 
 
@@ -121,9 +120,9 @@ def normalize_context_type(candidate: Optional[str]) -> Optional[str]:
 
 def normalize_compliance_category(candidate: Optional[str]) -> str:
     if not candidate:
-        return "ADMIN_ENFORCEMENT"
+        return "CONTROL"
     value = str(candidate).strip().upper()
-    return value if value in VALID_COMPLIANCE_CATEGORIES else "ADMIN_ENFORCEMENT"
+    return value if value in VALID_COMPLIANCE_CATEGORIES else "CONTROL"
 
 
 def normalize_check_method(candidate: Optional[str]) -> Optional[str]:
@@ -198,6 +197,7 @@ def main():
 
     for idx, item in enumerate(grouped, 1):
         context = item["context"]
+        normalized_context = " ".join(context.split())
         section_label = item.get("section") or f"group-{idx}"
         query = "Extract enforceable obligations in this section."
         prompt = build_prompt(context=context, query=query)
@@ -217,6 +217,7 @@ def main():
             check_method = normalize_check_method(rule.get("check_method"))
             pass_criteria = normalize_pass_criteria(rule.get("pass_criteria"))
             obligation_nature = normalize_obligation_nature(rule.get("obligation_nature"))
+            original_text = (rule.get("original_text") or "").strip()
             # Enforce the minimal gating contract: keep only rules that
             # have a claim + check_method + pass_criteria.
             if not rule.get("rule_objective"):
@@ -225,13 +226,19 @@ def main():
                 continue
             if pass_criteria not in {"binary", "evidence-based"}:
                 continue
+            if not original_text:
+                continue
+            # Drop hallucinated or paraphrased clauses: require verbatim substring of the context.
+            normalized_original = " ".join(original_text.split())
+            if original_text not in context and normalized_original not in normalized_context:
+                continue
             rule_counter += 1
             normalized = {
                 "rule_id": f"R-{rule_counter}",
                 "rule_ref": normalize_rule_ref(rule.get("rule_ref"), ref),
                 "compliance_category": normalize_compliance_category(rule.get("compliance_category")),
                 "rule_objective": rule.get("rule_objective"),
-                "original_text": rule.get("original_text"),
+                "original_text": original_text,
                 "obligation_nature": obligation_nature,
                 "check_method": check_method,
                 "pass_criteria": pass_criteria,
@@ -244,6 +251,10 @@ def main():
             context_type = normalize_context_type(ctx.get("context_type"))
             text = (ctx.get("text") or "").strip()
             if not context_type or not text:
+                continue
+            normalized_text = " ".join(text.split())
+            # Drop hallucinated or paraphrased context snippets: require verbatim substring of the context.
+            if text not in context and normalized_text not in normalized_context:
                 continue
             context_counter += 1
             normalized_ctx = {
