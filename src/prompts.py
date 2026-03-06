@@ -70,6 +70,11 @@ Classification rules:
   - Pick the single best category based on the governance role of the obligation (what dimension of the system's compliance governance it is constraining).
   - Do not output multiple categories, free-text labels, or synonyms.
   - If a provision cannot be clearly placed in one of these categories, treat it as Context (not a Rule).
+- Additional heuristic constraints:
+  - Source reference integrity: rule_ref/source_ref must align with the most specific subsection that actually contains the quoted original_text (for example, cite "Section 12(2)(a)" if the text is only from that subparagraph, not just "Section 12").
+  - Traceability anchoring: rule_ref/source_ref must function as a reliable locator for original_text so that an auditor can navigate from the citation to the exact quoted clause without guesswork.
+  - Conditional unity: when a clause is conditional ("if", "where", "subject to", "provided that"), keep the condition and its main obligation together in the same Rule or Context; never create a Rule from an obligation fragment that has been separated from its governing condition.
+  - Control-over-threshold classification: when a numerical threshold is used to trigger governance actions (for example, approval, review, or escalation), classify the Rule as CONTROL, not TRANSACTION_LIMIT, unless the law clearly imposes a direct quantitative cap on holdings or transaction activity.
 
 General rules:
 - Answer only from the provided context; do not invent, compress, or rewrite text outside it.
